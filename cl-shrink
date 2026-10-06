@@ -19,6 +19,7 @@ FORCE=0
 INCLUDE_LOCAL=0
 MIN_SIZE_MB=20
 MAX_PACK_GB=0 # 0 = no limit
+TOP_LEVEL=0
 
 usage() {
   cat >&2 <<'EOF'
@@ -51,6 +52,7 @@ while (($#)); do
     MAX_PACK_GB=${2:?}
     shift
     ;;
+  --top-level) TOP_LEVEL=1 ;;
   -h | --help) usage ;;
   -*) usage ;;
   *) ROOTS+=("$1") ;;
@@ -72,6 +74,17 @@ largest_pack_kb() {
 has_local_commits() {
   [[ -n $(git -C "$1" log --branches --not --remotes --format=%h -1 2>/dev/null) ]] ||
     [[ -n $(git -C "$1" stash list 2>/dev/null) ]]
+}
+
+# A gclient solution root (<checkout>/src, <checkout>/angle, ...) rather than a
+# dependency pulled in by DEPS. These hold your branches and dwarf everything
+# else, so they are opt-in and go last.
+is_solution_repo() {
+  local repo=$1 root
+  for root in "${ROOTS[@]}"; do
+    [[ ${repo%/*} == "${root%/}" ]] && return 0
+  done
+  return 1
 }
 
 # A stamp newer than every pack means nothing was fetched since the last run.
@@ -101,13 +114,32 @@ mapfile -t GIT_DIRS < <(
 )
 printf 'found %d repositories\n\n' "${#GIT_DIRS[@]}"
 
+# Dependencies first: their reclaimed space is what lets a solution repo clear
+# the headroom check later in the same run.
+DEPS=() SOLUTIONS=()
+for git_dir in "${GIT_DIRS[@]}"; do
+  if is_solution_repo "${git_dir%/.git}"; then
+    SOLUTIONS+=("$git_dir")
+  else
+    DEPS+=("$git_dir")
+  fi
+done
+
 total_before=0 total_after=0 processed=0 skipped=0
 start=$SECONDS
 
-for git_dir in "${GIT_DIRS[@]}"; do
+for git_dir in "${DEPS[@]}" "${SOLUTIONS[@]}"; do
   repo=${git_dir%/.git}
   label=${repo#"$HOME"/}
   before=$(du_kb "$git_dir")
+  solution=0
+  is_solution_repo "$repo" && solution=1
+
+  if ((solution && !TOP_LEVEL)); then
+    printf '  skip  %-60s solution repo (--top-level to include)\n' "$label"
+    ((skipped++))
+    continue
+  fi
 
   if ((before < MIN_SIZE_MB * 1024)); then
     ((skipped++))
@@ -126,23 +158,39 @@ for git_dir in "${GIT_DIRS[@]}"; do
     ((skipped++))
     continue
   fi
+  # `repack -a` rewrites every pack, so peak usage is the current store plus the
+  # largest pack it must reproduce. Geometric repack only rolls up the small
+  # per-fetch packs, so it needs a fraction of that and is the fallback for a
+  # solution repo too big to rewrite in place.
   avail=$(free_kb "$git_dir")
+  geometric=0
   if ((avail < pack_kb + 2097152)); then
-    printf '  SKIP  %-60s needs %d GB free, have %d GB\n' \
-      "$label" "$(((pack_kb + 2097152) / 1048576))" "$((avail / 1048576))"
-    ((skipped++))
-    continue
+    if ((solution)); then
+      geometric=1
+    else
+      printf '  SKIP  %-60s needs %d GB free, have %d GB\n' \
+        "$label" "$(((pack_kb + 2097152) / 1048576))" "$((avail / 1048576))"
+      ((skipped++))
+      continue
+    fi
   fi
 
   total_before=$((total_before + before))
   prune=1
-  if has_local_commits "$repo" && ! ((INCLUDE_LOCAL)); then
+  if ((geometric)) || (has_local_commits "$repo" && ! ((INCLUDE_LOCAL))); then
     prune=0
   fi
 
+  if ((geometric)); then
+    plan='geometric (too big to rewrite, rolling up fetch packs)'
+  elif ((prune)); then
+    plan='repack+prune'
+  else
+    plan='repack only (local commits)'
+  fi
+
   if ((DRY_RUN)); then
-    printf '  %-62s %6.2f GB  %s\n' "$label" "$((before * 100 / 1048576))e-2" \
-      "$([[ $prune == 1 ]] && echo 'repack+prune' || echo 'repack only (local commits)')"
+    printf '  %-62s %6.2f GB  %s\n' "$label" "$((before * 100 / 1048576))e-2" "$plan"
     ((processed++))
     continue
   fi
@@ -155,15 +203,19 @@ for git_dir in "${GIT_DIRS[@]}"; do
     git -C "$repo" reflog expire --expire=now --expire-unreachable=now --all
   fi
 
-  repack_args=(-a -d -f --quiet)
-  ((AGGRESSIVE)) && repack_args+=(--window=250 --depth=50)
+  if ((geometric)); then
+    repack_args=(--geometric=2 -d --quiet)
+  else
+    repack_args=(-a -d -f --quiet)
+    ((AGGRESSIVE)) && repack_args+=(--window=250 --depth=50)
+  fi
   if ! git -C "$repo" repack "${repack_args[@]}"; then
     printf 'FAILED (left intact)\n'
     rm -f "$git_dir"/objects/pack/tmp_pack_* 2>/dev/null
     total_after=$((total_after + before))
     continue
   fi
-  git -C "$repo" prune --expire=now 2>/dev/null
+  ((prune)) && git -C "$repo" prune --expire=now 2>/dev/null
 
   after=$(du_kb "$git_dir")
   total_after=$((total_after + after))

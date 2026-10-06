@@ -65,6 +65,7 @@ Requires bash 4+ and git 2.20+. No other dependencies.
 cl-shrink --dry-run ~/chromium              # report, change nothing
 cl-shrink ~/chromium ~/chromium_2           # shrink, multiple roots are fine
 cl-shrink -a ~/chromium                     # --window=250: ~7% smaller, ~4x the CPU
+cl-shrink --top-level ~/chromium            # include src/ itself (see below)
 ```
 
 | option | effect |
@@ -75,6 +76,7 @@ cl-shrink -a ~/chromium                     # --window=250: ~7% smaller, ~4x the
 | `--include-local` | also prune tags/reflogs in repos holding local commits |
 | `--min-size MB` | skip repos with a `.git` smaller than this (default 20) |
 | `--max-pack GB` | skip repos whose largest pack exceeds this |
+| `--top-level` | also shrink the checkout's own solution repos (`src`, `angle`, ...) |
 
 Budget roughly **4 minutes per GB** of `.git` on 16 cores, so a full checkout takes a
 couple of hours. It is interruptible; re-running picks up where it stopped.
@@ -90,17 +92,49 @@ couple of hours. It is interruptible; re-running picks up where it stopped.
 - A failed `repack` leaves the repository untouched and cleans up `tmp_pack_*`.
 - A stamp file per repo means a re-run skips anything that has not been fetched since.
 
+## `--top-level`: the checkout's own repos
+
+The gclient solution roots (`<checkout>/src`, and `angle`, `skia`, ... if you have them)
+are the biggest object stores you own -- ~65 GB for Chromium `src` -- and they are the
+ones holding your branches. They are **opt-in**, and they are processed **last**, after
+the dependency pass has freed space, so that they can clear the headroom check within a
+single run.
+
+```
+$ cl-shrink ~/chromium                     # default
+  skip  chromium/src   solution repo (--top-level to include)
+```
+
+Full `repack -a` has to reproduce every pack before dropping the originals, so it needs
+free space equal to the largest existing pack. For a 63 GB clone pack that is 63 GB of
+headroom, which is exactly what you do not have when you reach for this tool. Rather than
+give up, `--top-level` falls back to a **geometric repack** (`repack --geometric=2 -d`):
+it leaves the giant clone pack alone and rolls up only the small per-fetch packs, so peak
+usage is a couple of GB.
+
+That fallback is precisely aimed at the "grows and never shrinks" problem, because the
+per-fetch packs *are* the growth. Measured on a real `src` with six months of syncs on it:
+
+```
+BEFORE: 68049 MB, packs=29
+git repack --geometric=2 -d      1m38s
+AFTER:  66579 MB, packs=4        -1469 MB
+```
+
+Not dramatic in percentage terms, but it is bounded, it takes 98 seconds, and it keeps the
+pack count from creeping upward forever. Once the dependency pass has freed enough space,
+the same invocation does the full `-f` repack instead and reports a much larger number.
+
+Solution repos are detected as holding local commits, so they are never pruned: your
+branches, tags and reflogs survive. Verified on a 65 GB `src` -- 133 branches and 38,897
+tags intact, `git fsck` clean.
+
 ### The one thing it will not do
 
-Your main `src/.git` is usually the biggest single object store (~65 GB for Chromium) and
-it is excluded in practice: repacking it needs ~65 GB of free space, which is exactly what
-you do not have when you reach for this tool. Run the dependency pass first, then point
-`cl-shrink --include-local` at it once there is headroom.
-
-If you keep several checkouts, note that each one stores a full copy of the same
-`src` history. Sharing it via `objects/info/alternates` saves far more than repacking
-ever will -- but a `gc` in the donor repository can corrupt the borrowers and gclient
-knows nothing about it, so `cl-shrink` deliberately stays away from that.
+If you keep several checkouts, each one stores a full copy of the same `src` history --
+197 GB for three. Sharing it via `objects/info/alternates` saves far more than repacking
+ever will. But a `gc` in the donor repository can corrupt the borrowers and gclient knows
+nothing about the arrangement, so `cl-shrink` deliberately stays away from it.
 
 ## License
 

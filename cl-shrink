@@ -12,6 +12,7 @@
 # skia/tflite. Anything removed here is restored by `gclient sync`.
 
 set -uo pipefail
+trap 'kill 0 2>/dev/null; exit 130' INT TERM
 
 AGGRESSIVE=0
 DRY_RUN=0
